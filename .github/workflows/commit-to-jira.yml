@@ -1,0 +1,47 @@
+name: Commit → Jira
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # 15분마다 (GitHub 사정에 따라 지연될 수 있음)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Jira에 실제로 만들지 않고 목록만 출력"
+        type: boolean
+        default: true
+      lookback_hours:
+        description: "몇 시간 전 커밋까지 볼지"
+        default: "24"
+
+# 실행이 겹치면 같은 커밋으로 이슈가 두 번 만들어질 수 있으므로 직렬화한다.
+concurrency:
+  group: commit-to-jira
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # 스케줄 실행은 레포 변수 SYNC_ENABLED=true 일 때만 동작한다 (수동 실행은 항상 가능).
+    if: github.event_name == 'workflow_dispatch' || vars.SYNC_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python commit_to_jira.py
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_ORG: ${{ vars.GH_ORG }}
+          GH_AUTHOR: ${{ vars.GH_AUTHOR }}
+          GH_REPOS: ${{ vars.GH_REPOS }}
+          BRANCH_SCOPE: ${{ vars.BRANCH_SCOPE }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_PROJECT_KEY: ${{ vars.JIRA_PROJECT_KEY }}
+          JIRA_ISSUE_TYPE: ${{ vars.JIRA_ISSUE_TYPE }}
+          JIRA_LABELS: ${{ vars.JIRA_LABELS }}
+          JIRA_ASSIGNEE_ACCOUNT_ID: ${{ vars.JIRA_ASSIGNEE_ACCOUNT_ID }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          LOOKBACK_HOURS: ${{ inputs.lookback_hours || '24' }}
