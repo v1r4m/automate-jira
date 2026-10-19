@@ -7,6 +7,16 @@ macOS launchd로 내 컴퓨터에서 15분마다 실행됩니다.
 - 커밋 1개당 Jira 이슈 1개를 만들고, 라벨 `gh-commit-<sha>`로 중복 생성을 막습니다 (state 파일 없음).
 - 모든 브랜치를 봅니다. 같은 커밋이 여러 브랜치에 있으면 1개만 만들고, merge 커밋은 건너뜁니다.
 
+## LLM 티켓 문구
+
+`AX_LINK_API_KEY`가 있으면 사내 AX Link 게이트웨이(기본 `anthropic/claude-haiku-5.5`)로 커밋 내용을 정리해 티켓을 씁니다.
+
+- **LLM에 보내는 것:** 커밋 메시지, 변경 파일 목록, 줄 수. `SEND_DIFF=true`면 diff 일부(최대 6000자)도 보냅니다.
+- **제목:** `[레포] 업무 언어로 쓴 요약` 형식입니다.
+- **본문:** 배경 / 작업 내용 / 기대 효과 / 확인 포인트 아래에 커밋 정보(링크, 브랜치, 변경 규모, 원본 메시지)가 붙습니다.
+- LLM 호출이 실패하거나 `USE_LLM=false`면 커밋 메시지를 그대로 씁니다. 이슈 생성 자체는 막지 않습니다.
+- 문구를 미리 보려면: `DRY_RUN=true LOOKBACK_HOURS=336 GH_REPOS=sms ./run.sh`
+
 ## 머지 → 완료 규칙
 
 아직 완료되지 않은 자동 생성 이슈마다, 본문의 커밋 링크로 다음을 확인합니다.
@@ -67,6 +77,10 @@ macOS는 launchd 작업이 `~/Documents` 같은 보호된 폴더를 읽지 못�
 | `AUTO_DONE_ON_MERGE` | | `true`. 머지되면 완료 처리 |
 | `MERGE_BASE_BRANCHES` | | 비우면 어느 브랜치로든 PR이 머지되면 완료. 예: `prd,main`이면 그 브랜치로 머지된 경우만 |
 | `JIRA_DONE_TRANSITION` | | 쓸 전환 이름 (예: `완료`). 비우면 취소·거절 등을 뺀 '완료' 분류의 첫 전환 |
+| `AX_LINK_API_KEY` | | 사내 AX Link 키(`svc_...`). 비우면 LLM 없이 커밋 메시지 사용 |
+| `AX_LINK_MODEL` | | `anthropic/claude-haiku-5.5` |
+| `USE_LLM` | | `true` |
+| `SEND_DIFF` | | `false`. `true`면 diff 일부도 LLM에 보냄 |
 | `DRY_RUN` | | `true`면 Jira를 바꾸지 않고 출력만 함 |
 
 > org가 SSO를 쓰면 PAT를 만든 뒤 **Configure SSO → Authorize**를 해야 org 레포가 보입니다.

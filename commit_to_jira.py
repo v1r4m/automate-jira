@@ -54,13 +54,13 @@ class HttpError(Exception):
         self.status = status
 
 
-def request(method: str, url: str, headers: dict, body: dict | None = None):
+def request(method: str, url: str, headers: dict, body: dict | None = None, timeout: int = 30):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     if data is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
             payload = json.loads(raw) if raw else None
             return payload, resp.headers
@@ -148,6 +148,23 @@ class GitHub:
                 return
             cursor = refs["pageInfo"]["endCursor"]
 
+    def commit_detail(self, full_name: str, sha: str) -> dict:
+        data, _ = self.get(f"/repos/{full_name}/commits/{sha}")
+        return {
+            "additions": data.get("stats", {}).get("additions", 0),
+            "deletions": data.get("stats", {}).get("deletions", 0),
+            "files": [
+                {
+                    "name": f.get("filename", "?"),
+                    "status": f.get("status", "?"),
+                    "additions": f.get("additions", 0),
+                    "deletions": f.get("deletions", 0),
+                    "patch": f.get("patch", ""),
+                }
+                for f in data.get("files") or []
+            ],
+        }
+
     def merge_reason(self, owner: str, name: str, sha: str, base_branches: set[str]) -> str | None:
         """커밋이 머지됐으면 그 근거(사람이 읽을 문장)를, 아니면 None 을 돌려준다.
 
@@ -162,13 +179,14 @@ class GitHub:
             return None
         for pr in commit["associatedPullRequests"]["nodes"]:
             if pr["merged"] and (not base_branches or pr["baseRefName"] in base_branches):
-                return f"PR #{pr['number']} 이(가) {pr['baseRefName']} 브랜치로 머지됨: {pr['url']}"
+                return (f"PR #{pr['number']} \"{pr['title']}\" 이(가) {pr['baseRefName']} 브랜치에 머지되어 "
+                        f"작업을 완료 처리합니다. {pr['url']}")
         default = repo["defaultBranchRef"]["name"]
         if base_branches and default not in base_branches:
             return None
         compare, _ = self.get(f"/repos/{owner}/{name}/compare/{urllib.parse.quote(default)}...{sha}")
         if compare["status"] in ("behind", "identical"):
-            return f"커밋이 {default} 브랜치에 포함됨"
+            return f"커밋이 {default} 브랜치에 반영되어 작업을 완료 처리합니다."
         return None
 
 
@@ -179,7 +197,7 @@ query($owner: String!, $name: String!, $oid: GitObjectID!) {
     object(oid: $oid) {
       ... on Commit {
         associatedPullRequests(first: 10) {
-          nodes { number url merged baseRefName }
+          nodes { number title url merged baseRefName }
         }
       }
     }
@@ -397,37 +415,180 @@ def collect_commits(gh: GitHub, org: str, author: str, since: datetime, all_bran
     return sorted(commits.values(), key=lambda c: c.date)
 
 
-def adf_description(c: Commit) -> dict:
-    def field(name: str, text: str, href: str | None = None) -> dict:
-        value = {"type": "text", "text": text}
-        if href:
-            value["marks"] = [{"type": "link", "attrs": {"href": href}}]
-        return {
-            "type": "paragraph",
-            "content": [{"type": "text", "text": f"{name}: ", "marks": [{"type": "strong"}]}, value],
-        }
+# ---------------------------------------------------------------------------- LLM
 
+# 사내 AX Link 게이트웨이(OpenAI Chat Completions 형식). 모델명 프리픽스로 provider 가 정해진다.
+AX_LINK_API = "https://ax-link-api.fnf.co.kr/v1/chat/completions"
+DEFAULT_MODEL = "anthropic/claude-haiku-5.5"
+MAX_FILES_IN_PROMPT = 40
+MAX_DIFF_CHARS = 6000
+
+TICKET_SYSTEM_PROMPT = """\
+당신은 F&F IT 조직의 개발자입니다. 방금 GitHub에 올린 커밋을 근거로, 사내 IT 업무 요청 채널(Jira ITSM)에 \
+남길 작업 티켓을 직접 작성합니다. 이 티켓은 현업 담당자와 IT 동료가 "무엇이, 왜, 어떻게 바뀌었는지"를 \
+코드를 보지 않고도 이해할 수 있어야 합니다.
+
+아래 JSON 하나만 출력하세요. 코드펜스나 다른 설명은 붙이지 마세요.
+{
+  "summary": "티켓 제목. 60자 이내. 어떤 화면/기능에서 무엇을 개선·수정했는지 업무 언어로. 레포 이름, 'feat:'/'fix:' 같은 접두어는 빼세요.",
+  "background": "왜 이 작업이 필요했는지 2~3문장. 어떤 문제나 요구가 있었는지.",
+  "changes": ["무엇을 어떻게 바꿨는지 3~6개 항목. 각 항목은 한 문장, '~하도록 수정' '~를 추가' 같은 개조식."],
+  "impact": "이 변경으로 사용자·업무에 무엇이 나아지는지 1~3문장.",
+  "check_points": ["배포 후 현업이나 IT가 확인해 보면 좋을 점 0~3개. 근거가 없으면 빈 배열."]
+}
+
+작성 규칙:
+- 근거는 제공된 커밋 메시지, 변경 파일, 줄 수(있으면 diff)에 실제로 드러난 사실로 한정합니다. \
+없는 기능·수치·영향을 지어내지 마세요. 확실하지 않은 내용은 쓰지 마세요.
+- 전문 용어는 필요한 만큼만 쓰고, 파일명·함수명 나열보다 화면·기능·업무 흐름 중심으로 설명하세요.
+- 정중한 존댓말 서술체. 과장된 홍보 문구, 이모지, 마크다운 문법은 쓰지 마세요.
+- 커밋 해시나 링크는 넣지 마세요(따로 붙습니다)."""
+
+# Co-Authored-By 같은 트레일러가 남아 있으면 모델이 그걸 내용으로 착각하므로 지운다.
+TRAILER_RE = re.compile(
+    r"^\s*(co-authored-by:|signed-off-by:|co-committed-by:|reviewed-by:|🤖|generated with\b)", re.IGNORECASE
+)
+
+
+def clean_message(message: str) -> str:
+    return "\n".join(line for line in message.splitlines() if not TRAILER_RE.match(line)).strip()
+
+
+def llm_complete(system: str, user: str, api_key: str, model: str) -> str:
+    payload, _ = request("POST", AX_LINK_API, {"Authorization": f"Bearer {api_key}", "User-Agent": "automate-jira"}, {
+        "model": model,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "max_tokens": 4096,
+    }, timeout=120)
+    choices = payload.get("choices") or []
+    text = (choices[0].get("message", {}).get("content") or "").strip() if choices else ""
+    if not text:
+        raise RuntimeError(f"AX Link 응답이 비어 있음: {str(payload)[:200]}")
+    return text
+
+
+def ticket_prompt(c: Commit, detail: dict, send_diff: bool) -> str:
+    message = clean_message(c.message)
+    subject, _, body = message.partition("\n")
+    lines = [
+        f"저장소: {c.repo} (브랜치 {c.branch})",
+        f"커밋 제목: {subject}",
+    ]
+    if body.strip():
+        lines.append(f"커밋 본문:\n{body.strip()}")
+    lines.append(f"변경 규모: 파일 {len(detail['files'])}개, +{detail['additions']} / -{detail['deletions']} 줄")
+    lines.append("변경 파일:")
+    for f in detail["files"][:MAX_FILES_IN_PROMPT]:
+        lines.append(f"  - {f['status']} {f['name']} (+{f['additions']}/-{f['deletions']})")
+    if len(detail["files"]) > MAX_FILES_IN_PROMPT:
+        lines.append(f"  - …외 {len(detail['files']) - MAX_FILES_IN_PROMPT}개 파일")
+    if send_diff:
+        budget = MAX_DIFF_CHARS
+        for f in detail["files"]:
+            if not f["patch"] or budget <= 0:
+                continue
+            chunk = f["patch"][:budget]
+            budget -= len(chunk)
+            lines.append(f"diff {f['name']}:\n{chunk}")
+    lines.append("\n위 커밋을 바탕으로 작업 티켓 JSON을 작성해 주세요.")
+    return "\n".join(lines)
+
+
+def parse_ticket(text: str) -> dict:
+    match = re.search(r"\{.*\}", text, re.DOTALL)  # 모델이 코드펜스를 붙여도 본문 JSON 만 꺼낸다
+    if not match:
+        raise RuntimeError(f"JSON 을 찾지 못함: {text[:200]}")
+    ticket = json.loads(match.group(0))
+    if not str(ticket.get("summary", "")).strip():
+        raise RuntimeError("summary 가 비어 있음")
     return {
-        "type": "doc",
-        "version": 1,
-        "content": [
-            field("Commit", c.sha[:12], c.url),
-            field("Repository", c.repo, f"https://github.com/{c.repo}"),
-            field("Branch", c.branch),
-            field("Author", c.author_name),
-            field("Date", c.date),
-            {"type": "codeBlock", "content": [{"type": "text", "text": c.message or "(no message)"}]},
-        ],
+        "summary": str(ticket["summary"]).strip(),
+        "background": str(ticket.get("background") or "").strip(),
+        "changes": [str(x).strip() for x in ticket.get("changes") or [] if str(x).strip()],
+        "impact": str(ticket.get("impact") or "").strip(),
+        "check_points": [str(x).strip() for x in ticket.get("check_points") or [] if str(x).strip()],
     }
 
 
-def issue_fields(c: Commit, project: str, issue_type: str, extra_labels: list[str], assignee: str | None) -> dict:
+def write_ticket(c: Commit, detail: dict) -> dict | None:
+    """LLM 으로 티켓 문구를 만든다. 꺼져 있거나 실패하면 None (커밋 메시지 그대로 사용)."""
+    api_key = env("AX_LINK_API_KEY")
+    if not api_key or not env_bool("USE_LLM", True):
+        return None
+    try:
+        text = llm_complete(TICKET_SYSTEM_PROMPT, ticket_prompt(c, detail, env_bool("SEND_DIFF", False)),
+                            api_key, env("AX_LINK_MODEL", DEFAULT_MODEL))
+        return parse_ticket(text)
+    except (HttpError, RuntimeError, ValueError, OSError) as e:
+        print(f"  ! LLM 문구 생성 실패, 커밋 메시지로 대체 ({c.repo}@{c.sha[:7]}): {e}", file=sys.stderr)
+        return None
+
+
+# ------------------------------------------------------------------------ issues
+
+
+def adf_text(text: str, href: str | None = None, strong: bool = False) -> dict:
+    node = {"type": "text", "text": text}
+    marks = []
+    if href:
+        marks.append({"type": "link", "attrs": {"href": href}})
+    if strong:
+        marks.append({"type": "strong"})
+    if marks:
+        node["marks"] = marks
+    return node
+
+
+def adf_heading(text: str) -> dict:
+    return {"type": "heading", "attrs": {"level": 3}, "content": [adf_text(text)]}
+
+
+def adf_paragraph(text: str) -> dict:
+    return {"type": "paragraph", "content": [adf_text(text)]}
+
+
+def adf_bullets(items: list[str]) -> dict:
+    return {"type": "bulletList", "content": [
+        {"type": "listItem", "content": [adf_paragraph(item)]} for item in items
+    ]}
+
+
+def adf_description(c: Commit, detail: dict, ticket: dict | None) -> dict:
+    def field(name: str, text: str, href: str | None = None) -> dict:
+        return {"type": "paragraph", "content": [adf_text(f"{name}: ", strong=True), adf_text(text, href)]}
+
+    content = []
+    if ticket:
+        if ticket["background"]:
+            content += [adf_heading("배경"), adf_paragraph(ticket["background"])]
+        if ticket["changes"]:
+            content += [adf_heading("작업 내용"), adf_bullets(ticket["changes"])]
+        if ticket["impact"]:
+            content += [adf_heading("기대 효과"), adf_paragraph(ticket["impact"])]
+        if ticket["check_points"]:
+            content += [adf_heading("확인 포인트"), adf_bullets(ticket["check_points"])]
+        content += [{"type": "rule"}, adf_heading("커밋 정보")]
+    content += [
+        field("Commit", c.sha[:12], c.url),
+        field("Repository", c.repo, f"https://github.com/{c.repo}"),
+        field("Branch", c.branch),
+        field("Author", c.author_name),
+        field("Date", c.date),
+        field("변경 규모", f"파일 {len(detail['files'])}개, +{detail['additions']} / -{detail['deletions']} 줄"),
+        {"type": "codeBlock", "content": [adf_text(clean_message(c.message) or "(no message)")]},
+    ]
+    return {"type": "doc", "version": 1, "content": content}
+
+
+def issue_fields(c: Commit, detail: dict, ticket: dict | None, project: str, issue_type: str,
+                 extra_labels: list[str], assignee: str | None) -> dict:
     repo_name = c.repo.split("/", 1)[1]
+    title = ticket["summary"] if ticket else c.title
     fields = {
         "project": {"key": project},
         "issuetype": {"name": issue_type},
-        "summary": f"[{repo_name}] {c.title}"[:255],
-        "description": adf_description(c),
+        "summary": f"[{repo_name}] {title}"[:255],
+        "description": adf_description(c, detail, ticket),
         "labels": [LABEL_PREFIX.rstrip("-"), c.label, *extra_labels],
     }
     if assignee:
@@ -472,13 +633,17 @@ def create_issues(gh: GitHub, jira: Jira, org: str, project: str, labels: list[s
 
     failed = 0
     for c in new:
-        fields = issue_fields(c, project, issue_type, labels, assignee)
-        if dry_run:
-            print(f"  [dry-run] {c.repo}@{c.sha[:7]} → {fields['summary']}")
-            continue
         try:
+            detail = gh.commit_detail(c.repo, c.sha)
+            ticket = write_ticket(c, detail)
+            fields = issue_fields(c, detail, ticket, project, issue_type, labels, assignee)
+            if dry_run:
+                print(f"  [dry-run] {c.repo}@{c.sha[:7]} → {fields['summary']}")
+                if ticket:
+                    print("    " + json.dumps(ticket, ensure_ascii=False, indent=2).replace("\n", "\n    "))
+                continue
             key = jira.create_issue(fields)
-            print(f"  생성 {key}: {c.repo}@{c.sha[:7]} {c.title}")
+            print(f"  생성 {key}: {c.repo}@{c.sha[:7]} {fields['summary']}")
         except HttpError as e:
             failed += 1
             print(f"  실패 {c.repo}@{c.sha[:7]}: {e}", file=sys.stderr)
