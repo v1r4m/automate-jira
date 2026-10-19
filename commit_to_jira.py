@@ -6,6 +6,7 @@
   2. 각 레포의 브랜치에서 GH_AUTHOR(기본: 토큰 소유자)의 커밋만 모은다.
   3. 이미 Jira에 만들어진 커밋(라벨 gh-commit-<sha>)은 건너뛴다.
   4. 나머지를 오래된 순서대로 Jira 이슈로 만든다.
+  5. 아직 열린 자동 생성 이슈 중, 커밋이 머지된 것은 완료로 전환한다.
 
 중복 방지 상태를 Jira 라벨에 저장하므로 별도 DB/state 파일이 필요 없고,
 같은 기간을 여러 번 돌려도 이슈가 중복 생성되지 않는다.
@@ -147,6 +148,45 @@ class GitHub:
                 return
             cursor = refs["pageInfo"]["endCursor"]
 
+    def merge_reason(self, owner: str, name: str, sha: str, base_branches: set[str]) -> str | None:
+        """커밋이 머지됐으면 그 근거(사람이 읽을 문장)를, 아니면 None 을 돌려준다.
+
+        - 커밋을 포함한 PR 이 머지됨 (squash/rebase 머지도 PR 로 잡힌다)
+        - 또는 커밋이 기본 브랜치에 이미 들어가 있음 (PR 없이 직접 push 한 경우)
+        base_branches 가 비어 있지 않으면 그 브랜치로 머지된 경우만 인정한다.
+        """
+        data = self.graphql(MERGE_QUERY, {"owner": owner, "name": name, "oid": sha})
+        repo = data["repository"]
+        commit = repo and repo["object"]
+        if not commit:  # 레포가 없거나 force-push 등으로 커밋이 사라짐
+            return None
+        for pr in commit["associatedPullRequests"]["nodes"]:
+            if pr["merged"] and (not base_branches or pr["baseRefName"] in base_branches):
+                return f"PR #{pr['number']} 이(가) {pr['baseRefName']} 브랜치로 머지됨: {pr['url']}"
+        default = repo["defaultBranchRef"]["name"]
+        if base_branches and default not in base_branches:
+            return None
+        compare, _ = self.get(f"/repos/{owner}/{name}/compare/{urllib.parse.quote(default)}...{sha}")
+        if compare["status"] in ("behind", "identical"):
+            return f"커밋이 {default} 브랜치에 포함됨"
+        return None
+
+
+MERGE_QUERY = """
+query($owner: String!, $name: String!, $oid: GitObjectID!) {
+  repository(owner: $owner, name: $name) {
+    defaultBranchRef { name }
+    object(oid: $oid) {
+      ... on Commit {
+        associatedPullRequests(first: 10) {
+          nodes { number url merged baseRefName }
+        }
+      }
+    }
+  }
+}
+"""
+
 
 BRANCH_COMMITS_QUERY = """
 query($owner: String!, $name: String!, $cursor: String, $since: GitTimestamp!, $author: ID!) {
@@ -224,6 +264,47 @@ class Jira:
 
     def create_issue(self, fields: dict) -> str:
         return self.call("POST", "/rest/api/3/issue", {"fields": fields})["key"]
+
+    def open_commit_issues(self, project: str, labels: list[str]):
+        """아직 완료되지 않은 자동 생성 이슈를 (key, owner, repo, sha) 로 돌려준다."""
+        quoted = ", ".join(f'"{label}"' for label in labels)
+        body = {
+            "jql": f'project = "{project}" AND labels in ({quoted}) AND statusCategory != Done',
+            "fields": ["description"],
+            "maxResults": 100,
+        }
+        while True:
+            result = self.call("POST", "/rest/api/3/search/jql", body)
+            for issue in result.get("issues", []):
+                # 이슈 본문에 넣어 둔 커밋 링크에서 레포와 sha 를 읽는다.
+                match = COMMIT_URL_RE.search(json.dumps(issue["fields"].get("description") or {}))
+                if match:
+                    yield issue["key"], *match.groups()
+            token = result.get("nextPageToken")
+            if not token:
+                return
+            body["nextPageToken"] = token
+
+    def done_transition(self, key: str, preferred: str) -> dict | None:
+        transitions = self.call("GET", f"/rest/api/3/issue/{key}/transitions")["transitions"]
+        if preferred:
+            for t in transitions:
+                if preferred in (t["name"], t["to"]["name"]):
+                    return t
+        for t in transitions:
+            if t["to"]["statusCategory"]["key"] == "done":
+                return t
+        return None
+
+    def complete(self, key: str, transition: dict, comment: str) -> None:
+        self.call("POST", f"/rest/api/3/issue/{key}/comment", {"body": {
+            "type": "doc", "version": 1,
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": comment}]}],
+        }})
+        self.call("POST", f"/rest/api/3/issue/{key}/transitions", {"transition": {"id": transition["id"]}})
+
+
+COMMIT_URL_RE = re.compile(r"https://github\.com/([^/\"]+)/([^/\"]+)/commit/([0-9a-f]{40})")
 
 
 # ------------------------------------------------------------------------ commits
@@ -315,7 +396,7 @@ def issue_fields(c: Commit, project: str, issue_type: str, extra_labels: list[st
         "issuetype": {"name": issue_type},
         "summary": f"[{repo_name}] {c.title}"[:255],
         "description": adf_description(c),
-        "labels": [c.label, *extra_labels],
+        "labels": [LABEL_PREFIX.rstrip("-"), c.label, *extra_labels],
     }
     if assignee:
         fields["assignee"] = {"accountId": assignee}
@@ -325,16 +406,12 @@ def issue_fields(c: Commit, project: str, issue_type: str, extra_labels: list[st
 # --------------------------------------------------------------------------- main
 
 
-def main() -> int:
-    dry_run = env_bool("DRY_RUN", False)
-
-    gh = GitHub(env("GH_TOKEN", required=True))
-    org = env("GH_ORG", required=True)
+def create_issues(gh: GitHub, jira: Jira, org: str, project: str, labels: list[str], dry_run: bool) -> int:
     author = env("GH_AUTHOR") or gh.login()
     since = datetime.now(timezone.utc) - timedelta(hours=float(env("LOOKBACK_HOURS", "24")))
     repo_filter = {r.strip() for r in env("GH_REPOS").split(",") if r.strip()}
 
-    print(f"org={org} author={author} since={iso(since)} dry_run={dry_run}")
+    print(f"[생성] org={org} author={author} since={iso(since)}")
     commits = collect_commits(
         gh, org, author, since,
         all_branches=env("BRANCH_SCOPE", "all") == "all",
@@ -345,27 +422,25 @@ def main() -> int:
     if not commits:
         return 0
 
-    jira = Jira(env("JIRA_BASE_URL", required=True), env("JIRA_EMAIL", required=True),
-                env("JIRA_API_TOKEN", required=True))
-    project = env("JIRA_PROJECT_KEY", required=True)
+    existing = jira.existing_labels(project, [c.label for c in commits])
+    new = [c for c in commits if c.label not in existing]
+    print(f"이미 등록됨 {len(commits) - len(new)}개, 새로 생성할 커밋 {len(new)}개")
+    if not new:
+        return 0
+
     issue_type = env("JIRA_ISSUE_TYPE", "Task")
     available = jira.issue_type_names(project)
     if issue_type not in available:
         sys.exit(f"프로젝트 {project} 에 이슈 유형 '{issue_type}' 이 없습니다. JIRA_ISSUE_TYPE 을 다음 중 하나로 지정하세요: {available}")
-    extra_labels = [label.strip() for label in env("JIRA_LABELS", "auto-commit").split(",") if label.strip()]
     assignee = env("JIRA_ASSIGNEE_ACCOUNT_ID", "me")
     if assignee == "me":
         assignee = jira.my_account_id()
     elif assignee == "none":
         assignee = None
 
-    existing = jira.existing_labels(project, [c.label for c in commits])
-    new = [c for c in commits if c.label not in existing]
-    print(f"이미 등록됨 {len(commits) - len(new)}개, 새로 생성할 커밋 {len(new)}개")
-
     failed = 0
     for c in new:
-        fields = issue_fields(c, project, issue_type, extra_labels, assignee)
+        fields = issue_fields(c, project, issue_type, labels, assignee)
         if dry_run:
             print(f"  [dry-run] {c.repo}@{c.sha[:7]} → {fields['summary']}")
             continue
@@ -375,6 +450,51 @@ def main() -> int:
         except HttpError as e:
             failed += 1
             print(f"  실패 {c.repo}@{c.sha[:7]}: {e}", file=sys.stderr)
+    return failed
+
+
+def complete_merged(gh: GitHub, jira: Jira, project: str, labels: list[str], dry_run: bool) -> int:
+    base_branches = {b.strip() for b in env("MERGE_BASE_BRANCHES").split(",") if b.strip()}
+    preferred = env("JIRA_DONE_TRANSITION")
+
+    issues = list(jira.open_commit_issues(project, [LABEL_PREFIX.rstrip("-"), *labels]))
+    print(f"[완료] 아직 열린 커밋 이슈 {len(issues)}개 확인")
+
+    failed = 0
+    for key, owner, repo, sha in issues:
+        try:
+            reason = gh.merge_reason(owner, repo, sha, base_branches)
+            if not reason:
+                continue
+            transition = jira.done_transition(key, preferred)
+            if not transition:
+                failed += 1
+                print(f"  {key}: 완료로 보낼 전환(transition)을 찾지 못함", file=sys.stderr)
+                continue
+            if dry_run:
+                print(f"  [dry-run] {key} → {transition['to']['name']} ({reason})")
+                continue
+            jira.complete(key, transition, f"[automate-jira] {reason}")
+            print(f"  완료 {key} → {transition['to']['name']} ({reason})")
+        except (HttpError, RuntimeError) as e:
+            failed += 1
+            print(f"  실패 {key}: {e}", file=sys.stderr)
+    return failed
+
+
+def main() -> int:
+    dry_run = env_bool("DRY_RUN", False)
+    gh = GitHub(env("GH_TOKEN", required=True))
+    jira = Jira(env("JIRA_BASE_URL", required=True), env("JIRA_EMAIL", required=True),
+                env("JIRA_API_TOKEN", required=True))
+    org = env("GH_ORG", required=True)
+    project = env("JIRA_PROJECT_KEY", required=True)
+    labels = [label.strip() for label in env("JIRA_LABELS", "auto-commit").split(",") if label.strip()]
+    print(f"{datetime.now().isoformat(timespec='seconds')} dry_run={dry_run}")
+
+    failed = create_issues(gh, jira, org, project, labels, dry_run)
+    if env_bool("AUTO_DONE_ON_MERGE", True):
+        failed += complete_merged(gh, jira, project, labels, dry_run)
     return 1 if failed else 0
 
 
