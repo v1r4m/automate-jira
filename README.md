@@ -14,7 +14,12 @@ macOS launchd로 내 컴퓨터에서 15분마다 실행됩니다.
 1. 커밋을 포함한 **PR이 머지됨** (squash·rebase 머지 포함)
 2. 또는 커밋이 레포의 **기본 브랜치**에 들어가 있음 (PR 없이 직접 push한 경우)
 
-둘 중 하나라도 해당하면 머지 근거를 코멘트로 남기고, 상태 분류가 '완료'인 전환으로 옮깁니다.
+둘 중 하나라도 해당하면 머지 근거를 코멘트로 남기고 완료 상태로 옮깁니다.
+
+- 상태 분류가 '완료'인 전환을 쓰되, **취소·거절·반려** 같은 전환은 제외합니다. ITSM에는 '할 일 → 취소'가 완료 분류로 있습니다.
+- ITSM처럼 '할 일'에서 '완료'로 바로 갈 수 없으면 **'진행 중'을 거쳐서** 갑니다 (할 일 → 진행 중 → 완료).
+- 특정 전환을 쓰고 싶으면 `JIRA_DONE_TRANSITION`에 이름을 지정하세요.
+- 방금 만든 이슈는 Jira 검색 인덱스에 늦게 반영될 수 있습니다. 그런 경우 다음 실행에서 완료 처리됩니다.
 
 > 기본 브랜치는 레포마다 다릅니다. 예를 들어 `sms`는 `prd`라서, master에 push한 커밋은 master가 prd로 머지될 때 완료됩니다.
 > 기본 브랜치에 바로 커밋하면 이슈가 만들어진 다음 실행에서 곧바로 완료됩니다.
@@ -55,13 +60,13 @@ macOS는 launchd 작업이 `~/Documents` 같은 보호된 폴더를 읽지 못�
 | `JIRA_BASE_URL` | ✅ | `https://fnf.atlassian.net` |
 | `JIRA_EMAIL` | ✅ | Atlassian 계정 이메일 |
 | `JIRA_API_TOKEN` | ✅ | https://id.atlassian.com/manage-profile/security/api-tokens |
-| `JIRA_PROJECT_KEY` | ✅ | `ERPTEST` |
-| `JIRA_ISSUE_TYPE` | | ERPTEST는 `작업` (기본값 `Task`. 없는 유형이면 사용 가능한 목록을 출력하고 멈춤) |
+| `JIRA_PROJECT_KEY` | ✅ | `ITSM` |
+| `JIRA_ISSUE_TYPE` | | ITSM·ERPTEST 모두 `작업` (기본값 `Task`. 없는 유형이면 사용 가능한 목록을 출력하고 멈춤) |
 | `JIRA_LABELS` | | `auto-commit` (쉼표로 여러 개) |
 | `JIRA_ASSIGNEE_ACCOUNT_ID` | | `me`(기본) / `none` / accountId |
 | `AUTO_DONE_ON_MERGE` | | `true`. 머지되면 완료 처리 |
 | `MERGE_BASE_BRANCHES` | | 비우면 어느 브랜치로든 PR이 머지되면 완료. 예: `prd,main`이면 그 브랜치로 머지된 경우만 |
-| `JIRA_DONE_TRANSITION` | | 쓸 전환 이름 (예: `완료`). 비우면 상태 분류가 '완료'인 첫 전환 |
+| `JIRA_DONE_TRANSITION` | | 쓸 전환 이름 (예: `완료`). 비우면 취소·거절 등을 뺀 '완료' 분류의 첫 전환 |
 | `DRY_RUN` | | `true`면 Jira를 바꾸지 않고 출력만 함 |
 
 > org가 SSO를 쓰면 PAT를 만든 뒤 **Configure SSO → Authorize**를 해야 org 레포가 보입니다.

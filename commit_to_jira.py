@@ -285,23 +285,55 @@ class Jira:
                 return
             body["nextPageToken"] = token
 
-    def done_transition(self, key: str, preferred: str) -> dict | None:
-        transitions = self.call("GET", f"/rest/api/3/issue/{key}/transitions")["transitions"]
-        if preferred:
-            for t in transitions:
-                if preferred in (t["name"], t["to"]["name"]):
-                    return t
-        for t in transitions:
-            if t["to"]["statusCategory"]["key"] == "done":
-                return t
-        return None
+    def transitions(self, key: str) -> list[dict]:
+        return self.call("GET", f"/rest/api/3/issue/{key}/transitions")["transitions"]
 
-    def complete(self, key: str, transition: dict, comment: str) -> None:
-        self.call("POST", f"/rest/api/3/issue/{key}/comment", {"body": {
-            "type": "doc", "version": 1,
-            "content": [{"type": "paragraph", "content": [{"type": "text", "text": comment}]}],
-        }})
-        self.call("POST", f"/rest/api/3/issue/{key}/transitions", {"transition": {"id": transition["id"]}})
+    def complete(self, key: str, preferred: str, comment: str, dry_run: bool) -> str | None:
+        """이슈를 완료 상태로 옮기고 도착한 상태 이름을 돌려준다. 갈 방법이 없으면 None.
+
+        '할 일 → 진행 중 → 완료' 처럼 바로 갈 수 없는 워크플로는 진행 중 상태를 거쳐 간다.
+        dry_run 이면 실제로 옮기지 않고 경로만 계산한다(첫 단계까지만 확인 가능).
+        """
+        path: list[dict] = []
+        for _ in range(3):
+            transitions = self.transitions(key)
+            done = pick_done_transition(transitions, preferred)
+            if done:
+                path.append(done)
+                break
+            visited = {t["to"]["name"] for t in path}
+            step = next((t for t in transitions if t["to"]["statusCategory"]["key"] == "indeterminate"
+                         and t["to"]["name"] not in visited), None)
+            if not step:
+                return None
+            path.append(step)
+            if dry_run:  # 실제로 옮기지 않으면 그다음 전환은 알 수 없다
+                return " → ".join(t["to"]["name"] for t in path) + " → …"
+            self.call("POST", f"/rest/api/3/issue/{key}/transitions", {"transition": {"id": step["id"]}})
+        else:
+            return None
+
+        if not dry_run:
+            self.call("POST", f"/rest/api/3/issue/{key}/comment", {"body": {
+                "type": "doc", "version": 1,
+                "content": [{"type": "paragraph", "content": [{"type": "text", "text": comment}]}],
+            }})
+            self.call("POST", f"/rest/api/3/issue/{key}/transitions", {"transition": {"id": path[-1]["id"]}})
+        return " → ".join(t["to"]["name"] for t in path)
+
+
+# 상태 분류는 '완료'지만 작업이 끝난 게 아닌 전환 (예: ITSM 의 '취소')
+NOT_DONE_WORDS = ("취소", "거절", "반려", "철회", "cancel", "reject", "decline", "won't", "invalid", "duplicate")
+
+
+def pick_done_transition(transitions: list[dict], preferred: str) -> dict | None:
+    if preferred:
+        return next((t for t in transitions if preferred in (t["name"], t["to"]["name"])), None)
+    for t in transitions:
+        name = f"{t['name']} {t['to']['name']}".lower()
+        if t["to"]["statusCategory"]["key"] == "done" and not any(w in name for w in NOT_DONE_WORDS):
+            return t
+    return None
 
 
 COMMIT_URL_RE = re.compile(r"https://github\.com/([^/\"]+)/([^/\"]+)/commit/([0-9a-f]{40})")
@@ -466,16 +498,12 @@ def complete_merged(gh: GitHub, jira: Jira, project: str, labels: list[str], dry
             reason = gh.merge_reason(owner, repo, sha, base_branches)
             if not reason:
                 continue
-            transition = jira.done_transition(key, preferred)
-            if not transition:
+            path = jira.complete(key, preferred, f"[automate-jira] {reason}", dry_run)
+            if not path:
                 failed += 1
                 print(f"  {key}: 완료로 보낼 전환(transition)을 찾지 못함", file=sys.stderr)
                 continue
-            if dry_run:
-                print(f"  [dry-run] {key} → {transition['to']['name']} ({reason})")
-                continue
-            jira.complete(key, transition, f"[automate-jira] {reason}")
-            print(f"  완료 {key} → {transition['to']['name']} ({reason})")
+            print(f"  {'[dry-run] ' if dry_run else ''}완료 {key} → {path} ({reason})")
         except (HttpError, RuntimeError) as e:
             failed += 1
             print(f"  실패 {key}: {e}", file=sys.stderr)
