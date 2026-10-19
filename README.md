@@ -38,7 +38,7 @@ Settings → Secrets and variables → Actions
 | `GH_ORG` | ✅ | `fnf-es` |
 | `JIRA_BASE_URL` | ✅ | `https://fnf.atlassian.net` |
 | `JIRA_PROJECT_KEY` | ✅ | `ERPTEST` |
-| `JIRA_ISSUE_TYPE` | | `Task` (없는 유형이면 실행 시 사용 가능한 목록을 출력) |
+| `JIRA_ISSUE_TYPE` | | ERPTEST는 `작업` (기본값 `Task`, 없는 유형이면 실행 시 사용 가능한 목록을 출력) |
 | `JIRA_LABELS` | | `auto-commit` (쉼표로 여러 개) |
 | `JIRA_ASSIGNEE_ACCOUNT_ID` | | `me`(기본, 나에게 할당) / `none` / accountId |
 | `GH_AUTHOR` | | 비우면 PAT 소유자 |
@@ -55,6 +55,7 @@ gh secret set JIRA_API_TOKEN
 gh variable set GH_ORG --body fnf-es
 gh variable set JIRA_BASE_URL --body https://fnf.atlassian.net
 gh variable set JIRA_PROJECT_KEY --body ERPTEST
+gh variable set JIRA_ISSUE_TYPE --body 작업
 ```
 
 ### 3. 테스트 후 켜기
