@@ -5,8 +5,9 @@
   1. 최근 LOOKBACK_HOURS 동안 push된 org 레포를 훑는다.
   2. 각 레포의 브랜치에서 GH_AUTHOR(기본: 토큰 소유자)의 커밋만 모은다.
   3. 이미 Jira에 만들어진 커밋(라벨 gh-commit-<sha>)은 건너뛴다.
-  4. 나머지를 오래된 순서대로 Jira 이슈로 만든다.
-  5. 아직 열린 자동 생성 이슈 중, 커밋이 머지된 것은 완료로 전환한다.
+  4. 나머지를 오래된 순서대로 Jira 이슈로 만든다. REPO_COMPONENTS 의 레포면 컴포넌트를 붙이고,
+     REPO_EPIC_PROJECTS 의 레포면 그 프로젝트에 에픽을 만들어 이슈와 링크한다.
+  5. 아직 열린 자동 생성 이슈(에픽 포함) 중, 커밋이 머지된 것은 완료로 전환한다.
 
 중복 방지 상태를 Jira 라벨에 저장하므로 별도 DB/state 파일이 필요 없고,
 같은 기간을 여러 번 돌려도 이슈가 중복 생성되지 않는다.
@@ -36,6 +37,12 @@ def env(name: str, default: str | None = None, required: bool = False) -> str:
     if required and not value:
         sys.exit(f"환경변수 {name} 가 필요합니다.")
     return value or ""
+
+
+def env_map(name: str) -> dict[str, str]:
+    """'sms=SMSDEV;wms=WMSDEV' 형식을 {레포: 값} 으로 읽는다. 컴포넌트 이름에 쉼표·콜론이 있어 ; 로 구분한다."""
+    pairs = (item.split("=", 1) for item in env(name).split(";") if "=" in item)
+    return {repo.strip(): value.strip() for repo, value in pairs if repo.strip() and value.strip()}
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -127,8 +134,8 @@ class GitHub:
     def branch_commits(self, owner: str, name: str, author_id: str, since: datetime):
         """최근 갱신된 브랜치들에서 author 의 커밋을 (branch, commit) 으로 돌려준다.
 
-        브랜치를 마지막 커밋 날짜 내림차순으로 받아 since 이전 브랜치가 나오면 멈추므로,
-        브랜치가 수백 개인 레포도 요청 몇 번이면 끝난다.
+        TAG_COMMIT_DATE 정렬은 브랜치에서 날짜순을 보장하지 않으므로(예: sms 에서 prd 가 더 최근
+        master 보다 먼저 온다) 중간에 멈추지 않고 모든 브랜치를 보며 since 이전 브랜치만 건너뛴다.
         """
         cursor = None
         while True:
@@ -141,7 +148,7 @@ class GitHub:
                 if not target.get("committedDate"):  # 태그 등 커밋이 아닌 대상
                     continue
                 if parse_ts(target["committedDate"]) < since:
-                    return
+                    continue
                 for commit in target["history"]["nodes"]:
                     yield ref["name"], commit
             if not refs["pageInfo"]["hasNextPage"]:
@@ -259,9 +266,9 @@ class Jira:
         result = self.call("GET", f"/rest/api/3/issue/createmeta/{urllib.parse.quote(project)}/issuetypes")
         return [t["name"] for t in result.get("issueTypes", result.get("values", []))]
 
-    def existing_labels(self, project: str, labels: list[str]) -> set[str]:
-        """labels 중 이미 project 의 이슈에 붙어 있는 것만 돌려준다."""
-        found: set[str] = set()
+    def keys_by_label(self, project: str, labels: list[str]) -> dict[str, str]:
+        """labels 중 이미 project 의 이슈에 붙어 있는 것을 {라벨: 이슈 키} 로 돌려준다."""
+        found: dict[str, str] = {}
         for i in range(0, len(labels), 50):
             chunk = labels[i : i + 50]
             quoted = ", ".join(f'"{label}"' for label in chunk)
@@ -273,21 +280,28 @@ class Jira:
             while True:
                 result = self.call("POST", "/rest/api/3/search/jql", body)
                 for issue in result.get("issues", []):
-                    found.update(issue["fields"].get("labels") or [])
+                    for label in issue["fields"].get("labels") or []:
+                        found.setdefault(label, issue["key"])
                 token = result.get("nextPageToken")
                 if not token:
                     break
                 body["nextPageToken"] = token
-        return found & set(labels)
+        return {label: key for label, key in found.items() if label in labels}
 
     def create_issue(self, fields: dict) -> str:
         return self.call("POST", "/rest/api/3/issue", {"fields": fields})["key"]
 
-    def open_commit_issues(self, project: str, labels: list[str]):
+    def link(self, a: str, b: str, link_type: str) -> None:
+        self.call("POST", "/rest/api/3/issueLink", {
+            "type": {"name": link_type}, "outwardIssue": {"key": a}, "inwardIssue": {"key": b},
+        })
+
+    def open_commit_issues(self, projects: list[str], labels: list[str]):
         """아직 완료되지 않은 자동 생성 이슈를 (key, owner, repo, sha) 로 돌려준다."""
         quoted = ", ".join(f'"{label}"' for label in labels)
+        in_projects = ", ".join(f'"{p}"' for p in projects)
         body = {
-            "jql": f'project = "{project}" AND labels in ({quoted}) AND statusCategory != Done',
+            "jql": f"project in ({in_projects}) AND labels in ({quoted}) AND statusCategory != Done",
             "fields": ["description"],
             "maxResults": 100,
         }
@@ -309,22 +323,25 @@ class Jira:
     def complete(self, key: str, preferred: str, comment: str, dry_run: bool) -> str | None:
         """이슈를 완료 상태로 옮기고 도착한 상태 이름을 돌려준다. 갈 방법이 없으면 None.
 
-        '할 일 → 진행 중 → 완료' 처럼 바로 갈 수 없는 워크플로는 진행 중 상태를 거쳐 간다.
+        '할 일 → 진행 중 → 완료' 처럼 바로 갈 수 없는 워크플로는 아직 안 거친 상태를 따라 최대 6단계까지 간다.
         dry_run 이면 실제로 옮기지 않고 경로만 계산한다(첫 단계까지만 확인 가능).
         """
         path: list[dict] = []
-        for _ in range(3):
+        visited = {self.call("GET", f"/rest/api/3/issue/{key}?fields=status")["fields"]["status"]["name"]}
+        for _ in range(6):
             transitions = self.transitions(key)
             done = pick_done_transition(transitions, preferred)
             if done:
                 path.append(done)
                 break
-            visited = {t["to"]["name"] for t in path}
-            step = next((t for t in transitions if t["to"]["statusCategory"]["key"] == "indeterminate"
-                         and t["to"]["name"] not in visited), None)
+            # 진행 중 상태를 우선 거치고, SMSDEV 처럼 '백로그 → 미해결' 을 먼저 지나야 하면 할 일 상태도 거친다.
+            candidates = [t for t in transitions if t["to"]["name"] not in visited]
+            step = next((t for category in ("indeterminate", "new") for t in candidates
+                         if t["to"]["statusCategory"]["key"] == category), None)
             if not step:
                 return None
             path.append(step)
+            visited.add(step["to"]["name"])
             if dry_run:  # 실제로 옮기지 않으면 그다음 전환은 알 수 없다
                 return " → ".join(t["to"]["name"] for t in path) + " → …"
             self.call("POST", f"/rest/api/3/issue/{key}/transitions", {"transition": {"id": step["id"]}})
@@ -434,7 +451,8 @@ TICKET_SYSTEM_PROMPT = """\
   "background": "왜 이 작업이 필요했는지 2~3문장. 어떤 문제나 요구가 있었는지.",
   "changes": ["무엇을 어떻게 바꿨는지 3~6개 항목. 각 항목은 한 문장, '~하도록 수정' '~를 추가' 같은 개조식."],
   "impact": "이 변경으로 사용자·업무에 무엇이 나아지는지 1~3문장.",
-  "check_points": ["배포 후 현업이나 IT가 확인해 보면 좋을 점 0~3개. 근거가 없으면 빈 배열."]
+  "check_points": ["배포 후 현업이나 IT가 확인해 보면 좋을 점 0~3개. 근거가 없으면 빈 배열."],
+  "tasks": [{"summary": "개발 작업 제목. 40자 이내.", "description": "이 작업에서 한 일 1~3문장."}]
 }
 
 작성 규칙:
@@ -442,7 +460,9 @@ TICKET_SYSTEM_PROMPT = """\
 없는 기능·수치·영향을 지어내지 마세요. 확실하지 않은 내용은 쓰지 마세요.
 - 전문 용어는 필요한 만큼만 쓰고, 파일명·함수명 나열보다 화면·기능·업무 흐름 중심으로 설명하세요.
 - 정중한 존댓말 서술체. 과장된 홍보 문구, 이모지, 마크다운 문법은 쓰지 마세요.
-- 커밋 해시나 링크는 넣지 마세요(따로 붙습니다)."""
+- 커밋 해시나 링크는 넣지 마세요(따로 붙습니다).
+- tasks는 이 커밋의 작업을 개발팀 백로그(에픽 아래 작업)용으로 나눈 것입니다. 화면·API·DB·배치·설정처럼 \
+성격이 다른 변경은 따로, 같은 성격의 자잘한 변경은 하나로 묶어 1~6개로 나누세요. 작은 커밋이면 1개로 충분합니다."""
 
 # Co-Authored-By 같은 트레일러가 남아 있으면 모델이 그걸 내용으로 착각하므로 지운다.
 TRAILER_RE = re.compile(
@@ -507,6 +527,10 @@ def parse_ticket(text: str) -> dict:
         "changes": [str(x).strip() for x in ticket.get("changes") or [] if str(x).strip()],
         "impact": str(ticket.get("impact") or "").strip(),
         "check_points": [str(x).strip() for x in ticket.get("check_points") or [] if str(x).strip()],
+        "tasks": [
+            {"summary": str(t["summary"]).strip(), "description": str(t.get("description") or "").strip()}
+            for t in ticket.get("tasks") or [] if isinstance(t, dict) and str(t.get("summary") or "").strip()
+        ],
     }
 
 
@@ -553,10 +577,22 @@ def adf_bullets(items: list[str]) -> dict:
     ]}
 
 
-def adf_description(c: Commit, detail: dict, ticket: dict | None) -> dict:
+def adf_commit_info(c: Commit, detail: dict) -> list[dict]:
     def field(name: str, text: str, href: str | None = None) -> dict:
         return {"type": "paragraph", "content": [adf_text(f"{name}: ", strong=True), adf_text(text, href)]}
 
+    return [
+        field("Commit", c.sha[:12], c.url),
+        field("Repository", c.repo, f"https://github.com/{c.repo}"),
+        field("Branch", c.branch),
+        field("Author", c.author_name),
+        field("Date", c.date),
+        field("변경 규모", f"파일 {len(detail['files'])}개, +{detail['additions']} / -{detail['deletions']} 줄"),
+        {"type": "codeBlock", "content": [adf_text(clean_message(c.message) or "(no message)")]},
+    ]
+
+
+def adf_description(c: Commit, detail: dict, ticket: dict | None) -> dict:
     content = []
     if ticket:
         if ticket["background"]:
@@ -568,20 +604,11 @@ def adf_description(c: Commit, detail: dict, ticket: dict | None) -> dict:
         if ticket["check_points"]:
             content += [adf_heading("확인 포인트"), adf_bullets(ticket["check_points"])]
         content += [{"type": "rule"}, adf_heading("커밋 정보")]
-    content += [
-        field("Commit", c.sha[:12], c.url),
-        field("Repository", c.repo, f"https://github.com/{c.repo}"),
-        field("Branch", c.branch),
-        field("Author", c.author_name),
-        field("Date", c.date),
-        field("변경 규모", f"파일 {len(detail['files'])}개, +{detail['additions']} / -{detail['deletions']} 줄"),
-        {"type": "codeBlock", "content": [adf_text(clean_message(c.message) or "(no message)")]},
-    ]
-    return {"type": "doc", "version": 1, "content": content}
+    return {"type": "doc", "version": 1, "content": content + adf_commit_info(c, detail)}
 
 
 def issue_fields(c: Commit, detail: dict, ticket: dict | None, project: str, issue_type: str,
-                 extra_labels: list[str], assignee: str | None) -> dict:
+                 extra_labels: list[str], assignee: str | None, component: str | None = None) -> dict:
     repo_name = c.repo.split("/", 1)[1]
     title = ticket["summary"] if ticket else c.title
     fields = {
@@ -593,7 +620,42 @@ def issue_fields(c: Commit, detail: dict, ticket: dict | None, project: str, iss
     }
     if assignee:
         fields["assignee"] = {"accountId": assignee}
+    if component:
+        fields["components"] = [{"name": component}]
     return fields
+
+
+def epic_tasks(c: Commit, ticket: dict | None) -> list[dict]:
+    """에픽 아래 둘 작업 목록. LLM 이 나눈 tasks → 없으면 작업 내용 항목 → 그것도 없으면 커밋 제목 1개."""
+    if ticket and ticket["tasks"]:
+        return ticket["tasks"]
+    if ticket and ticket["changes"]:
+        return [{"summary": change, "description": ""} for change in ticket["changes"]]
+    return [{"summary": ticket["summary"] if ticket else c.title, "description": ""}]
+
+
+def task_fields(c: Commit, detail: dict, task: dict, project: str, issue_type: str, epic_key: str,
+                extra_labels: list[str], assignee: str | None) -> dict:
+    # 커밋 링크와 라벨을 에픽과 똑같이 달아 두면, 머지될 때 같은 규칙으로 함께 완료된다.
+    content = [adf_paragraph(task["description"])] if task["description"] else []
+    content += [{"type": "rule"}, adf_heading("커밋 정보"), *adf_commit_info(c, detail)]
+    fields = {
+        "project": {"key": project},
+        "issuetype": {"name": issue_type},
+        "parent": {"key": epic_key},
+        "summary": f"[{c.repo.split('/', 1)[1]}] {task['summary']}"[:255],
+        "description": {"type": "doc", "version": 1, "content": content},
+        "labels": [LABEL_PREFIX.rstrip("-"), c.label, *extra_labels],
+    }
+    if assignee:
+        fields["assignee"] = {"accountId": assignee}
+    return fields
+
+
+def require_issue_type(jira: Jira, project: str, issue_type: str, env_name: str) -> None:
+    available = jira.issue_type_names(project)
+    if issue_type not in available:
+        sys.exit(f"프로젝트 {project} 에 이슈 유형 '{issue_type}' 이 없습니다. {env_name} 을 다음 중 하나로 지정하세요: {available}")
 
 
 # --------------------------------------------------------------------------- main
@@ -615,16 +677,38 @@ def create_issues(gh: GitHub, jira: Jira, org: str, project: str, labels: list[s
     if not commits:
         return 0
 
-    existing = jira.existing_labels(project, [c.label for c in commits])
-    new = [c for c in commits if c.label not in existing]
-    print(f"이미 등록됨 {len(commits) - len(new)}개, 새로 생성할 커밋 {len(new)}개")
-    if not new:
+    components = env_map("REPO_COMPONENTS")
+    epic_projects = env_map("REPO_EPIC_PROJECTS")
+
+    def repo_name(c: Commit) -> str:
+        return c.repo.split("/", 1)[1]
+
+    existing = jira.keys_by_label(project, [c.label for c in commits])
+    # 에픽은 ITSM 이슈와 따로 확인한다. 에픽 생성만 실패했던 커밋은 다음 실행에서 에픽만 다시 만든다.
+    epic_existing: dict[str, set[str]] = {}
+    for epic_project in set(epic_projects.values()):
+        labels_in_project = [c.label for c in commits if epic_projects.get(repo_name(c)) == epic_project]
+        epic_existing[epic_project] = set(jira.keys_by_label(epic_project, labels_in_project))
+
+    def needs_epic(c: Commit) -> bool:
+        epic_project = epic_projects.get(repo_name(c))
+        return bool(epic_project) and c.label not in epic_existing[epic_project]
+
+    todo = [c for c in commits if c.label not in existing or needs_epic(c)]
+    new_count = sum(c.label not in existing for c in todo)
+    print(f"이미 등록됨 {len(commits) - new_count}개, 새로 생성할 커밋 {new_count}개, "
+          f"에픽만 만들 커밋 {len(todo) - new_count}개")
+    if not todo:
         return 0
 
     issue_type = env("JIRA_ISSUE_TYPE", "Task")
-    available = jira.issue_type_names(project)
-    if issue_type not in available:
-        sys.exit(f"프로젝트 {project} 에 이슈 유형 '{issue_type}' 이 없습니다. JIRA_ISSUE_TYPE 을 다음 중 하나로 지정하세요: {available}")
+    require_issue_type(jira, project, issue_type, "JIRA_ISSUE_TYPE")
+    epic_type = env("EPIC_ISSUE_TYPE", "에픽")
+    task_type = env("EPIC_TASK_TYPE", "작업")
+    for epic_project in {epic_projects[repo_name(c)] for c in todo if needs_epic(c)}:
+        require_issue_type(jira, epic_project, epic_type, "EPIC_ISSUE_TYPE")
+        require_issue_type(jira, epic_project, task_type, "EPIC_TASK_TYPE")
+    link_type = env("EPIC_LINK_TYPE", "Relates")
     assignee = env("JIRA_ASSIGNEE_ACCOUNT_ID", "me")
     if assignee == "me":
         assignee = jira.my_account_id()
@@ -632,18 +716,37 @@ def create_issues(gh: GitHub, jira: Jira, org: str, project: str, labels: list[s
         assignee = None
 
     failed = 0
-    for c in new:
+    for c in todo:
         try:
             detail = gh.commit_detail(c.repo, c.sha)
             ticket = write_ticket(c, detail)
-            fields = issue_fields(c, detail, ticket, project, issue_type, labels, assignee)
+            fields = issue_fields(c, detail, ticket, project, issue_type, labels, assignee,
+                                  components.get(repo_name(c)))
+            epic_project = epic_projects.get(repo_name(c)) if needs_epic(c) else None
+            epic_fields = epic_project and issue_fields(c, detail, ticket, epic_project, epic_type, labels, assignee)
             if dry_run:
-                print(f"  [dry-run] {c.repo}@{c.sha[:7]} → {fields['summary']}")
-                if ticket:
+                key = existing.get(c.label)
+                print(f"  [dry-run] {c.repo}@{c.sha[:7]} → {key or '(새 이슈)'} {fields['summary']}"
+                      + (f" / 컴포넌트 {fields['components'][0]['name']}" if "components" in fields and not key else "")
+                      + (f" / {epic_project} 에픽 생성 후 {link_type} 링크" if epic_project else ""))
+                if ticket and c.label not in existing:
                     print("    " + json.dumps(ticket, ensure_ascii=False, indent=2).replace("\n", "\n    "))
+                if epic_project:
+                    for task in epic_tasks(c, ticket):
+                        print(f"    └ {task_type}: {task['summary']}")
                 continue
-            key = jira.create_issue(fields)
-            print(f"  생성 {key}: {c.repo}@{c.sha[:7]} {fields['summary']}")
+            key = existing.get(c.label)
+            if not key:
+                key = jira.create_issue(fields)
+                print(f"  생성 {key}: {c.repo}@{c.sha[:7]} {fields['summary']}")
+            if epic_fields:
+                epic_key = jira.create_issue(epic_fields)
+                jira.link(key, epic_key, link_type)
+                print(f"  에픽 {epic_key} ↔ {key}: {epic_fields['summary']}")
+                for task in epic_tasks(c, ticket):
+                    task_key = jira.create_issue(task_fields(c, detail, task, epic_project, task_type, epic_key,
+                                                             labels, assignee))
+                    print(f"    └ {task_type} {task_key}: {task['summary']}")
         except HttpError as e:
             failed += 1
             print(f"  실패 {c.repo}@{c.sha[:7]}: {e}", file=sys.stderr)
@@ -654,7 +757,9 @@ def complete_merged(gh: GitHub, jira: Jira, project: str, labels: list[str], dry
     base_branches = {b.strip() for b in env("MERGE_BASE_BRANCHES").split(",") if b.strip()}
     preferred = env("JIRA_DONE_TRANSITION")
 
-    issues = list(jira.open_commit_issues(project, [LABEL_PREFIX.rstrip("-"), *labels]))
+    # 에픽도 본문에 같은 커밋 링크가 있으므로 ITSM 이슈와 같은 규칙으로 완료된다.
+    projects = [project, *sorted(set(env_map("REPO_EPIC_PROJECTS").values()) - {project})]
+    issues = list(jira.open_commit_issues(projects, [LABEL_PREFIX.rstrip("-"), *labels]))
     print(f"[완료] 아직 열린 커밋 이슈 {len(issues)}개 확인")
 
     failed = 0

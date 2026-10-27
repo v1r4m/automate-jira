@@ -17,6 +17,24 @@ macOS launchd로 내 컴퓨터에서 15분마다 실행됩니다.
 - LLM 호출이 실패하거나 `USE_LLM=false`면 커밋 메시지를 그대로 씁니다. 이슈 생성 자체는 막지 않습니다.
 - 문구를 미리 보려면: `DRY_RUN=true LOOKBACK_HOURS=336 GH_REPOS=sms ./run.sh`
 
+## 레포별 컴포넌트와 에픽
+
+특정 레포의 커밋에는 ITSM 컴포넌트를 붙이고, 개발 프로젝트에 에픽을 따로 만들 수 있습니다.
+
+```sh
+REPO_COMPONENTS="sms=SMS (매장관리시스템)"   # 따옴표 필수 (괄호·공백 때문)
+REPO_EPIC_PROJECTS=sms=SMSDEV
+```
+
+- 형식은 `레포=값`이고, 여러 개는 `;`로 구분합니다. 컴포넌트 이름에 쉼표·콜론이 있어서 `;`를 씁니다.
+- **에픽:** ITSM 이슈와 같은 제목·본문·라벨로 SMSDEV에 에픽을 만들고, ITSM 이슈와 `Relates`로 링크합니다.
+  ITSM 이슈에는 `상위 항목` 필드가 없어서, 에픽을 상위로 지정하지 않고 링크로 연결합니다.
+- **작업:** 에픽 아래에 `작업`을 만듭니다. LLM이 커밋을 화면·API·DB 등 성격별로 1~6개로 나눕니다.
+  LLM이 없거나 실패하면 커밋 제목 하나로 작업 1개를 만듭니다.
+- 에픽과 작업도 같은 커밋 링크와 라벨을 가지므로, 머지되면 ITSM 이슈와 함께 완료됩니다.
+- 에픽 생성만 실패했다면 다음 실행에서 에픽만 다시 만듭니다 (`LOOKBACK_HOURS` 안의 커밋만 해당).
+- 컴포넌트는 새로 만드는 ITSM 이슈에만 붙습니다. 이미 있는 이슈는 바꾸지 않습니다.
+
 ## 머지 → 완료 규칙
 
 아직 완료되지 않은 자동 생성 이슈마다, 본문의 커밋 링크로 다음을 확인합니다.
@@ -74,6 +92,11 @@ macOS는 launchd 작업이 `~/Documents` 같은 보호된 폴더를 읽지 못�
 | `JIRA_ISSUE_TYPE` | | ITSM·ERPTEST 모두 `작업` (기본값 `Task`. 없는 유형이면 사용 가능한 목록을 출력하고 멈춤) |
 | `JIRA_LABELS` | | `auto-commit` (쉼표로 여러 개) |
 | `JIRA_ASSIGNEE_ACCOUNT_ID` | | `me`(기본) / `none` / accountId |
+| `REPO_COMPONENTS` | | 레포별 ITSM 컴포넌트. 예: `"sms=SMS (매장관리시스템)"` |
+| `REPO_EPIC_PROJECTS` | | 레포별로 에픽을 만들 프로젝트. 예: `sms=SMSDEV` |
+| `EPIC_ISSUE_TYPE` | | `에픽` |
+| `EPIC_TASK_TYPE` | | 에픽 아래 만들 이슈 유형. `작업` |
+| `EPIC_LINK_TYPE` | | ITSM 이슈와 에픽을 잇는 링크 유형. `Relates` |
 | `AUTO_DONE_ON_MERGE` | | `true`. 머지되면 완료 처리 |
 | `MERGE_BASE_BRANCHES` | | 비우면 어느 브랜치로든 PR이 머지되면 완료. 예: `prd,main`이면 그 브랜치로 머지된 경우만 |
 | `JIRA_DONE_TRANSITION` | | 쓸 전환 이름 (예: `완료`). 비우면 취소·거절 등을 뺀 '완료' 분류의 첫 전환 |
